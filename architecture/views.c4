@@ -1,0 +1,183 @@
+// Views over the gas-city-dashboard model. Planned (#planned) and research
+// (#research) elements/relationships are dimmed + dashed so the "what exists
+// vs what is opt-in / proposed" split is readable at a glance.
+
+views {
+
+  // Landscape — the whole system in context.
+  view index {
+    title 'gas-city-dashboard — system landscape'
+    include *
+
+    style * {
+      opacity 25%
+    }
+    style element.tag == #built, element.tag == #evolving {
+      opacity 100%
+    }
+    style element.tag == #planned {
+      color muted
+      border dashed
+    }
+    style element.tag == #research {
+      color indigo
+      border dashed
+    }
+  }
+
+  // The dashboard system, decomposed into its three workspaces.
+  view dashboardSystem of dashboard {
+    title 'gas-city-dashboard — containers (backend / frontend / shared)'
+    include *
+
+    style element.tag == #planned {
+      color muted
+      border dashed
+    }
+    style element.tag == #research {
+      color indigo
+      border dashed
+    }
+  }
+
+  // Backend half — the local-capability service internals.
+  view backendContainer of dashboard.backend {
+    title 'Backend (Node/Express) — components'
+    description 'Binds 127.0.0.1 only. Owns local host capabilities + a transport-only supervisor relay; never a GC data facade.'
+    include *
+
+    style element.tag == #planned {
+      color muted
+      border dashed
+    }
+  }
+
+  // Frontend half — the React SPA internals.
+  view frontendContainer of dashboard.frontend {
+    title 'Frontend (React/Vite) — components'
+    include *
+
+    style element.tag == #planned {
+      color muted
+      border dashed
+    }
+  }
+
+  // The shared wire-shape SSOT.
+  view sharedContainer of dashboard.shared {
+    title 'shared — the wire-shape SSOT contract'
+    include *
+
+    style element.tag == #evolving {
+      color amber
+    }
+  }
+
+  // Risks & open questions — the elements that carry a #risk flag, with the
+  // open question stated in each box's description. The things a reviewer
+  // should probe, surfaced rather than discovered mid-meeting.
+  view risks {
+    title 'Risks & open questions'
+    include
+      dashboard,
+      element.tag == #risk,
+      dashboard.backend,
+      dashboard.frontend,
+      dashboard.shared
+
+    style * {
+      opacity 30%
+    }
+    style element.tag == #risk {
+      opacity 100%
+      color red
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Walkthrough flows (dynamic views) — the narrative spine of the review.
+  // ───────────────────────────────────────────────────────────────────────
+
+  // Flow 1 — first paint: bootstrap + a domain read.
+  dynamic view boot {
+    title 'Walkthrough — SPA bootstrap to first paint'
+    description 'The SPA loads from the same origin, reads /api/config for operator identity + enabled modules + read-only posture, then reads GC data straight from the supervisor through the transport relay.'
+
+    browser -> dashboard.frontend.appShell 'load SPA (single-origin)'
+    dashboard.frontend.appShell -> dashboard.frontend.apiClient 'api.config()'
+    dashboard.frontend.apiClient -> dashboard.backend.localRoutes 'GET /api/city/<city>/config'
+    dashboard.backend.localRoutes -> dashboard.frontend.appShell 'operator, enabledModules, defaultView, readOnly'
+    dashboard.frontend.appShell -> dashboard.frontend.routes 'mount the resolved default workspace'
+    dashboard.frontend.routes -> dashboard.frontend.supervisorClient 'first GC read'
+    dashboard.frontend.supervisorClient -> dashboard.backend.transportProxy 'GET /gc-supervisor/v0/...'
+    dashboard.backend.transportProxy -> supervisor 'forward (cache the two city-wide reads)'
+  }
+
+  // Flow 2 — the live-update spine (SSE).
+  dynamic view liveUpdate {
+    title 'Walkthrough — live update over SSE'
+    description 'The SPA holds an EventSource directly on the supervisor stream. A burst of bead/session events is coalesced (leading + trailing) into at most one refresh per window, which re-reads through the cache so the connection pool stays free.'
+
+    dashboard.frontend.liveHooks -> supervisor 'EventSource /v0/city/<city>/events/stream'
+    supervisor -> dashboard.frontend.liveHooks 'bead.* / session.* events'
+    dashboard.frontend.liveHooks -> dashboard.frontend.routes 'coalesced onMatch (refresh)'
+    dashboard.frontend.routes -> dashboard.frontend.supervisorClient 'refetch the changed slice'
+    dashboard.frontend.supervisorClient -> dashboard.backend.transportProxy 'GET (short-TTL cache for city-wide reads)'
+    dashboard.backend.transportProxy -> supervisor 'forward / serve cached'
+    dashboard.frontend.routes -> dashboard.frontend.attention 'recompute attention'
+    dashboard.frontend.attention -> dashboard.frontend.appShell 'update nav badges + ambient Home'
+  }
+
+  // Flow 3 — an operator write (CSRF + origin + always-from-operator).
+  dynamic view operatorWrite {
+    title 'Walkthrough — an operator write (bead / mail)'
+    description 'Mutations carry the X-GC-Request header and clear the Origin check + CSRF gate. Mail sends always go from the operator identity even while "Reading as" another agent — impersonation is read-only.'
+
+    dashboard.frontend.mailWorkspace -> dashboard.frontend.supervisorClient 'send (from operator) / claim / close'
+    dashboard.frontend.supervisorClient -> dashboard.backend.security 'POST with Origin + CSRF token + X-GC-Request'
+    dashboard.backend.security -> dashboard.backend.transportProxy 'origin ok, CSRF ok → relay'
+    dashboard.backend.transportProxy -> supervisor 'forward the write'
+    supervisor -> dashboard.frontend.liveHooks 'event reflects the write'
+  }
+
+  // Flow 4 — local evidence: a run git diff.
+  dynamic view runDiff {
+    title 'Walkthrough — run git diff (local evidence)'
+    description 'Run-detail git diffs are a dashboard-owned local capability, not GC data. The execution-folder cwd comes from untrusted supervisor run metadata, so it is confined to the RUN_CWD_ALLOWED_ROOTS prefix allowlist before git -C runs.'
+
+    dashboard.frontend.runComponents -> dashboard.frontend.apiClient 'POST /api/city/<city>/runs/<id>/diff'
+    dashboard.frontend.apiClient -> dashboard.backend.localRoutes 'run-diff request'
+    dashboard.backend.localRoutes -> dashboard.backend.execWrapper 'readRunGitDiff(cwd, allowedRoots)'
+    dashboard.backend.execWrapper -> hostCli 'git -C <confined cwd> diff (shell:false)'
+    dashboard.backend.execWrapper -> dashboard.backend.localRoutes 'capped, sanitised diff'
+    dashboard.backend.localRoutes -> dashboard.frontend.runComponents 'RunDiff DTO'
+  }
+
+  // Opt-in / planned lens: the modular Maintainer (Triage) workspace.
+  view planned {
+    title 'Opt-in & planned work — the Maintainer (Triage) module'
+    include
+      dashboard,
+      dashboard.backend.maintainerBackend,
+      dashboard.frontend.maintainerFrontend,
+      dashboard.backend.cityPlane,
+      dashboard.frontend.viewRegistry,
+      github,
+      supervisor,
+      operator
+
+    style * {
+      opacity 30%
+    }
+    style element.tag == #planned {
+      opacity 100%
+      color muted
+      border dashed
+    }
+    style element.tag == #research {
+      opacity 100%
+      color indigo
+      border dashed
+    }
+  }
+}

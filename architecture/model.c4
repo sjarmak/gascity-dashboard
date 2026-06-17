@@ -1,0 +1,317 @@
+// The `gas-city-dashboard` — an editorial-typographic ambient dashboard for a
+// single Gas City (`gc`) operator.
+//
+// Three workspaces (npm workspaces): a Node/Express backend, a React/Vite
+// frontend, and a `shared` package that is the wire-shape SSOT (DTOs + the
+// generated gc-supervisor OpenAPI client) imported by both halves. The
+// durable architectural boundary (specs/architecture/direct-supervisor-boundary.md)
+// is that GC-owned data is read by the BROWSER directly from the gc supervisor
+// (through a transport-only proxy), while the dashboard service owns only
+// local host capabilities — static hosting, runtime config, git/build/health
+// evidence, client-error telemetry, and audit rows.
+//
+// Elements carry `link`s to their real source under the repo, so a reviewer
+// can jump from any box to the code. Tags encode delivery state (see spec.c4).
+
+model {
+
+  operator = actor 'Operator' {
+    description 'A single human operator (identity supplied at boot via env, never hardcoded) who watches one Gas City and acts on what needs attention'
+  }
+
+  browser = actor 'Operator browser' {
+    description 'The SPA host — runs the React app, calls the supervisor directly for GC data and the dashboard service for local evidence'
+    style {
+      shape browser
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // External systems — the data source and the host-local CLIs the service
+  // shells out to. The dashboard synthesizes nothing; the corpus is the live
+  // city as the supervisor reports it.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  supervisor = externalSystem 'gc supervisor' {
+    description 'Gas City orchestrator API (default http://127.0.0.1:8372). SSOT for every GC-owned resource: cities, agents, sessions, beads, mail, formula runs, status, and the live event/session SSE streams (/v0/city/<city>/events/stream + /session/<id>/stream the SPA holds over EventSource)'
+    link ../specs/architecture/direct-supervisor-boundary.md 'direct-supervisor boundary'
+  }
+
+  hostCli = externalSystem 'Host CLIs & filesystem' {
+    description 'git / gh, the gc bd CLI city store on disk, the deploy build log, and .gc/events.jsonl — reached only through the whitelisted exec wrapper'
+  }
+
+  github = externalSystem 'GitHub' {
+    description 'Issues / PRs for the optional Maintainer (Triage) workspace — fetched in-browser; sling dispatch goes through the supervisor'
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // The dashboard system.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  dashboard = system 'gas-city-dashboard' {
+    description 'Single-operator ambient cockpit over one Gas City — calm by default, raises its voice only when something is wrong'
+    link ../README.md 'README'
+    link ../specs/architecture/overview.md 'architecture overview'
+    link ../DESIGN.md 'DESIGN.md — binding visual contract'
+
+    // ── Shared: the wire-shape SSOT contract ───────────────────────────────
+    shared = container 'shared — wire-shape SSOT' {
+      description 'shared/ — dashboard-owned /api DTOs + the generated gc-supervisor OpenAPI client; the single contract both halves import'
+      technology 'TypeScript / zod'
+      link ../shared/src 'shared/src/'
+
+      sharedDtos = component 'dashboard /api DTOs' {
+        #built
+        description 'Hand-authored DTOs for the dashboard-owned surface: beads, health, sessions, activity, links, run-detail, operator/mail, viewing-as'
+        link ../shared/src/index.ts 'index.ts (barrel)'
+      }
+      generatedClient = component 'generated gc-supervisor client' {
+        #evolving
+        #risk
+        description 'OpenAPI-generated types + SDK + zod schemas for the supervisor API. RISK: regenerated from the upstream spec (npm openapi:gc-supervisor:check guards drift) — an evolved supervisor frame the browser must tolerate, so the SDK carries no response validator'
+        link ../shared/src/generated/gc-supervisor-client 'generated/gc-supervisor-client/'
+        link ../specs/gc-supervisor-api-gaps.md 'supervisor API gaps'
+      }
+      sharedRuns = component 'run projection logic' {
+        #evolving
+        description 'runs/ — formula-run shaping, edges, lanes, liveness, display-state, stranded detection; the pure projection layer reused by both halves'
+        link ../shared/src/runs 'shared/src/runs/'
+      }
+      sharedProxyContract = component 'proxy / supervisor contract' {
+        #built
+        description 'supervisor-proxy + supervisor-status + cache-bypass header constants — the shared vocabulary between the SPA client and the backend transport proxy'
+        link ../shared/src/supervisor-proxy.ts 'supervisor-proxy.ts'
+      }
+      sharedFixtures = component 'test-city fixtures' {
+        #built
+        description 'fixtures/test-city — a deterministic city the snap/dashboard test harnesses render against without a live supervisor'
+        link ../shared/src/fixtures/test-city 'fixtures/test-city/'
+      }
+    }
+
+    // ── Backend: the local-capability service ───────────────────────────────
+    backend = container 'backend — Node/Express service' {
+      description 'backend/ — binds 127.0.0.1 ONLY; owns local host capabilities + a transport-only supervisor relay. Serves the built SPA in prod (single-port)'
+      technology 'TypeScript / Node / Express'
+      link ../backend/src 'backend/src/'
+
+      appBootstrap = component 'app + server bootstrap' {
+        #built
+        description 'createDashboardApp wires the middleware chain and mounts routers; server.ts binds the listener to 127.0.0.1 and runs lifecycle/shutdown'
+        link ../backend/src/app.ts 'app.ts'
+        link ../backend/src/server.ts 'server.ts'
+      }
+
+      config = component 'config (env knobs)' {
+        #built
+        description 'Single place for all env-driven knobs: port, supervisor URL, city name, read-only mode, operator identity, enabled modules, run-cwd allowlist'
+        link ../backend/src/config.ts 'config.ts'
+      }
+
+      security = component 'security middleware' {
+        #built
+        description 'Host-header allowlist (DNS-rebinding 421), Origin check on writes (403), CSP/clickjacking headers, double-submit CSRF cookie+token'
+        link ../backend/src/middleware/security.ts 'security.ts'
+        link ../backend/src/middleware/csrf.ts 'csrf.ts'
+        link ../specs/architecture/security.md 'security posture'
+      }
+
+      transportProxy = component '/gc-supervisor transport proxy' {
+        #built
+        #risk
+        description 'Transport-only relay to the supervisor (no DTO parsing). Same-origin convenience + a short-TTL single-flight cache for the two expensive city-wide reads. RISK: read-only mode (DASHBOARD_READONLY) default-denies to an allowlist + strips x-gc-request — but is OFF by default; an externally-fronted writable instance is the operator-owned exposure contract'
+        link ../backend/src/routes/supervisor-transport-proxy.ts 'supervisor-transport-proxy.ts'
+        link ../specs/architecture/exposure.md 'exposure runbook'
+      }
+
+      cityPlane = component 'per-city request plane' {
+        #built
+        description 'cityDispatch validates :cityName and resolves a per-city CityRuntime; each runtime owns its own GcClient + module routers + background samplers, so two cities never bleed inflight coalescing'
+        link ../backend/src/middleware/city-dispatch.ts 'city-dispatch.ts'
+        link ../backend/src/city/runtime.ts 'city/runtime.ts'
+        link ../backend/src/city/registry.ts 'city/registry.ts'
+      }
+
+      gcClient = component 'backend GcClient' {
+        #built
+        description 'Minimal supervisor client for HOST-LOCAL reads only (cities list, city status). Per-request timeout + single-flight inflight coalescing + edge zod validation of its narrow reads'
+        link ../backend/src/gc-client.ts 'gc-client.ts'
+      }
+
+      localRoutes = component 'local-evidence routes' {
+        #built
+        description 'git log views, deploy build log, run git-diff, dolt-noms trend, rig-store health, supervisor-status snapshots, /api/health — the dashboard-owned surface'
+        link ../backend/src/routes 'backend/src/routes/'
+        link ../backend/src/routes/git.ts 'git.ts'
+        link ../backend/src/routes/runs.ts 'runs.ts'
+      }
+
+      execWrapper = component 'whitelisted exec wrapper' {
+        #built
+        #risk
+        description 'The ONE privileged shell path: enum-whitelisted git/gh commands, shell:false, clean env, timeout + output cap + concurrency semaphore. RISK: run-diff git -C cwd comes from untrusted supervisor run metadata — confined by the opt-in RUN_CWD_ALLOWED_ROOTS prefix allowlist (shape-only when unset)'
+        link ../backend/src/exec.ts 'exec.ts'
+        link ../backend/src/exec-core.ts 'exec-core.ts'
+        link ../backend/src/runs/run-diff-policy.ts 'run-diff-policy.ts'
+      }
+
+      auditLog = component 'audit + structured logging' {
+        #built
+        description 'Append privileged actions to .gc/events.jsonl; request-log + sanitised structured logging (CR/LF-safe) across every route'
+        link ../backend/src/audit.ts 'audit.ts'
+        link ../backend/src/logging.ts 'logging.ts'
+      }
+
+      maintainerBackend = component 'maintainer module (backend)' {
+        #planned
+        description 'OPT-IN first-party Triage module (MODULES_ENABLED=maintainer; OFF by default). Per-city triage cache + slung-state + an in-process SSE registry that pushes refresh events; GitHub fetch + sling stay browser/supervisor-side'
+        link ../backend/src/views/modules/maintainer 'views/modules/maintainer/'
+        link ../backend/src/views/modules/maintainer/sse.ts 'sse.ts'
+        link ../specs/architecture/maintainer-coupling-audit.md 'coupling audit'
+      }
+    }
+
+    // ── Frontend: the React SPA ─────────────────────────────────────────────
+    frontend = container 'frontend — React SPA' {
+      description 'frontend/ — React 19 + Vite + Tailwind. Reads GC data directly from the supervisor; the calm "Reading Room" register is the binding visual contract (DESIGN.md)'
+      technology 'TypeScript / React / Vite / Tailwind'
+      link ../frontend/src 'frontend/src/'
+
+      appShell = component 'app shell + routing' {
+        #built
+        description 'App.tsx lazy-routes the domain workspaces under a Layout; bootstraps from /api/config (operator identity, enabled modules, default view, read-only posture)'
+        link ../frontend/src/App.tsx 'App.tsx'
+        link ../frontend/src/main.tsx 'main.tsx'
+      }
+
+      supervisorClient = component 'browser supervisor client' {
+        #built
+        description 'The typed SDK wrapper the SPA uses for ALL GC data — reads, writes (X-GC-Request mutation header), and the EventSource stream URLs. The direct-supervisor boundary in practice'
+        link ../frontend/src/supervisor/client.ts 'supervisor/client.ts'
+        link ../frontend/src/supervisor 'supervisor/'
+      }
+
+      apiClient = component 'dashboard /api client + cache' {
+        #built
+        description 'Typed client for the dashboard-owned /api surface (config, git, health, run-diff, client-errors) with a small in-memory fetch cache + CSRF token handling'
+        link ../frontend/src/api/client.ts 'api/client.ts'
+        link ../frontend/src/api/cache.ts 'api/cache.ts'
+      }
+
+      attention = component 'attention model' {
+        #built
+        description 'The shared severity model behind the nav badges and the ambient Home: contributors emit attention/watch/unavailable items, composed + ranked into a per-domain summary'
+        link ../frontend/src/attention/compose.ts 'attention/compose.ts'
+        link ../frontend/src/attention 'attention/'
+      }
+
+      liveHooks = component 'live-update hooks (SSE)' {
+        #built
+        description 'useGcEvents subscribes to the supervisor event stream over EventSource (coalesced, backoff-reconnecting); useSessionStream tails a session; run-summary subscription fans the bead bursts into refreshes'
+        link ../frontend/src/hooks/useGcEvents.ts 'hooks/useGcEvents.ts'
+        link ../frontend/src/hooks/useSessionStream.ts 'hooks/useSessionStream.ts'
+        link ../frontend/src/runs/runSummarySubscription.tsx 'runSummarySubscription.tsx'
+      }
+
+      routes = component 'domain workspaces (routes)' {
+        #built
+        description 'Home (ambient), Agents, Beads, Convoy, Runs + FormulaRunDetail, Mail — each a thoughtfully-set page rather than a wall of cards'
+        link ../frontend/src/routes 'frontend/src/routes/'
+      }
+
+      runComponents = component 'run-detail components' {
+        #evolving
+        description 'Formula-run diagram / map / lanes / node-session / diff panel — the graph.v2 run-detail surface, still tracking the upstream workflow snapshot shape'
+        link ../frontend/src/components/run 'components/run/'
+        link ../specs/architecture/formula-run-detail-type.md 'run-detail type'
+      }
+
+      mailWorkspace = component 'mail workspace' {
+        #built
+        #risk
+        description 'Read any agent inbox via a persistent "Reading as" strip. RISK guard: impersonation is READ-ONLY — sends always go from the operator identity, enforced in mailSender'
+        link ../frontend/src/routes/Mail.tsx 'Mail.tsx'
+        link ../frontend/src/lib/mailSender.ts 'lib/mailSender.ts'
+      }
+
+      viewRegistry = component 'frontend view registry' {
+        #built
+        description 'Compile-time list of first-party views (activity, health, maintainer) filtered against the backend enabledModules set; the edit IS the design-review checkpoint'
+        link ../frontend/src/views/registry.ts 'views/registry.ts'
+        link ../frontend/src/views/resolve.ts 'views/resolve.ts'
+      }
+
+      maintainerFrontend = component 'maintainer module (frontend)' {
+        #planned
+        description 'OPT-IN Triage view — needs-you / needs-triage / needs-pr sections, sling dispatch in-browser; mounts only when the backend reports maintainer enabled'
+        link ../frontend/src/views/modules/maintainer 'views/modules/maintainer/'
+        link ../specs/requirements/modular-dashboard-prd.md 'modular-dashboard PRD'
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Relationships.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // Operator → browser → SPA
+  operator -> browser 'watches; acts on what needs attention'
+  browser -> dashboard.frontend 'loads the SPA (single-origin)'
+
+  // The direct-supervisor boundary: browser reads GC data from the supervisor.
+  dashboard.frontend.supervisorClient -> dashboard.backend.transportProxy 'GC reads/writes (same-origin relay)'
+  dashboard.backend.transportProxy -> supervisor 'forwards /v0/* + /health (no DTO parsing)'
+  dashboard.frontend.liveHooks -> supervisor 'EventSource: city events + session streams'
+
+  // The SPA also reads the github triage surface directly (optional module).
+  dashboard.frontend.maintainerFrontend -> github 'fetch issues / PRs (browser-side)' {
+    #planned
+  }
+
+  // The SPA's own local-evidence surface (dashboard-owned /api).
+  dashboard.frontend.apiClient -> dashboard.backend.localRoutes '/api: config, git, health, run-diff, client-errors'
+
+  // Shared SSOT — both halves import it.
+  dashboard.frontend.supervisorClient -> dashboard.shared.generatedClient 'imports the generated SDK + types'
+  dashboard.frontend -> dashboard.shared 'imports DTOs + run projection'
+  dashboard.backend -> dashboard.shared 'imports DTOs + the proxy/cache-bypass contract'
+  dashboard.backend.gcClient -> dashboard.shared.generatedClient 'host-local reads via the generated SDK'
+
+  // Backend internal wiring.
+  dashboard.backend.appBootstrap -> dashboard.backend.config 'loads env knobs at boot'
+  dashboard.backend.appBootstrap -> dashboard.backend.security 'mounts host/origin/CSRF chain'
+  dashboard.backend.appBootstrap -> dashboard.backend.transportProxy 'mounts /gc-supervisor'
+  dashboard.backend.appBootstrap -> dashboard.backend.cityPlane 'mounts /api/city/:cityName/*'
+  dashboard.backend.appBootstrap -> dashboard.backend.localRoutes 'mounts top-level /api routes'
+  dashboard.backend.cityPlane -> dashboard.backend.gcClient 'per-city status reads'
+  dashboard.backend.cityPlane -> dashboard.backend.maintainerBackend 'mounts the module when enabled' {
+    #planned
+  }
+  dashboard.backend.localRoutes -> dashboard.backend.execWrapper 'git / build-log reads'
+  dashboard.backend.localRoutes -> dashboard.backend.auditLog 'records privileged actions'
+  dashboard.backend.execWrapper -> hostCli 'shell:false, whitelisted git/gh'
+  dashboard.backend.gcClient -> supervisor 'GET /v0/cities + /status (host-local)'
+
+  // Maintainer SSE refresh (planned/opt-in).
+  dashboard.backend.maintainerBackend -> github 'nightly triage worker fetch' {
+    #planned
+  }
+  dashboard.backend.maintainerBackend -> dashboard.frontend.maintainerFrontend 'SSE: refreshed event' {
+    #planned
+  }
+  dashboard.frontend.maintainerFrontend -> supervisor 'sling dispatch (gc sling)' {
+    #planned
+  }
+
+  // Frontend internal wiring.
+  dashboard.frontend.appShell -> dashboard.frontend.apiClient 'bootstraps from /api/config'
+  dashboard.frontend.appShell -> dashboard.frontend.routes 'lazy-routes the workspaces'
+  dashboard.frontend.appShell -> dashboard.frontend.viewRegistry 'mounts enabled module views'
+  dashboard.frontend.routes -> dashboard.frontend.supervisorClient 'GC reads/writes'
+  dashboard.frontend.routes -> dashboard.frontend.attention 'feeds the attention model'
+  dashboard.frontend.routes -> dashboard.frontend.liveHooks 'subscribes to live updates'
+  dashboard.frontend.routes -> dashboard.frontend.runComponents 'renders run-detail'
+  dashboard.frontend.mailWorkspace -> dashboard.frontend.supervisorClient 'send always-from-operator; impersonation read-only'
+  dashboard.frontend.attention -> dashboard.frontend.appShell 'nav badges + ambient Home'
+}

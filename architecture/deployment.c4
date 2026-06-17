@@ -1,0 +1,68 @@
+// Deployment model — where each piece runs at review time.
+//
+// The whole dashboard lives on ONE host alongside the gc supervisor. The
+// backend is a single Node process bound to 127.0.0.1 only; the frontend is a
+// Vite dev server in development and a static bundle served by that same Node
+// process in production (single-port). The supervisor is the read-only data
+// source over loopback. Network exposure is the operator's own concern — the
+// dashboard ships no auth and stays on loopback (specs/architecture/exposure.md).
+
+deployment {
+
+  operatorHost = host 'Operator host (single machine)' {
+    description 'One machine runs the supervisor, the dashboard backend, and (in dev) the Vite server. Reached from a laptop over an SSH port-forward — the supported device surface is a MacBook + the host console'
+
+    nodeProc = proc 'Node process — Express backend (127.0.0.1:8082 prod / :8081 dev)' {
+      description 'Binds 127.0.0.1 ONLY (HOST is ignored). Owns local capabilities + the transport relay; serves the built SPA in prod via express.static'
+      instanceOf dashboard.backend
+    }
+
+    viteProc = proc 'Vite dev server (127.0.0.1:5174)' {
+      description 'Dev only — serves the SPA and proxies /api + /gc-supervisor to the backend on loopback. In prod the Node process serves the static bundle instead'
+      instanceOf dashboard.frontend
+    }
+
+    spaBundle = proc 'frontend/dist static bundle' {
+      description 'Generated artifact (npm run build:frontend). The shared SSOT is compiled into both the backend dist and this bundle'
+      instanceOf dashboard.shared
+    }
+
+    supervisorProc = proc 'gc supervisor (127.0.0.1:8372)' {
+      description 'The Gas City orchestrator API + SSE streams. Read-only to the dashboard; the source of every GC-owned resource'
+      instanceOf supervisor
+    }
+
+    cliTools = proc 'git / gh / gc bd CLIs + .gc/events.jsonl' {
+      description 'Host-local tools the backend shells out to through the whitelisted exec wrapper, plus the audit log'
+      instanceOf hostCli
+    }
+  }
+
+  laptop = host 'Operator laptop (browser)' {
+    description 'Runs the browser. Reaches the dashboard over an SSH local port-forward to the loopback-bound backend'
+    instanceOf browser
+    instanceOf operator
+  }
+
+  githubHost = host 'GitHub' {
+    description 'Issues / PRs source for the optional Maintainer (Triage) workspace'
+    instanceOf github
+  }
+
+  // Runtime data & control flow between processes/hosts.
+  laptop -> nodeProc 'HTTPS over SSH port-forward → loopback'
+  laptop -> viteProc 'dev: same, to the Vite port'
+  nodeProc -> supervisorProc 'transport relay (forward /v0/*) + host-local status reads'
+  laptop -> supervisorProc 'browser EventSource: city + session SSE streams'
+  nodeProc -> cliTools 'whitelisted git/gh; audit append'
+  viteProc -> nodeProc 'dev proxy: /api + /gc-supervisor'
+  laptop -> githubHost 'browser-side triage fetch (opt-in module)'
+}
+
+views {
+
+  deployment view deployment {
+    title 'Deployment — where each piece runs (loopback-only backend)'
+    include *
+  }
+}
