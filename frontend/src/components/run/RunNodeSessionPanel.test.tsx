@@ -120,6 +120,40 @@ describe('RunNodeSessionPanel — visible-instance alignment', () => {
   });
 });
 
+describe('RunNodeSessionPanel — input immutability', () => {
+  it('sorts a copy: preserves the caller-owned array order while still displaying attempts sorted', () => {
+    const target = unsortedAttemptsNode();
+    const inputOrder = target.executionInstances.map((entry) => entry.id);
+
+    render(<RunNodeSessionPanel node={target} visible />);
+
+    // Rendering must not reorder the caller-owned run state: the panel sorts a
+    // copy, so other views that read node.executionInstances stay order-stable.
+    expect(target.executionInstances.map((entry) => entry.id)).toEqual(inputOrder);
+    // ...and the panel still presents attempts in ascending sorted order.
+    const attemptButtons = screen.getAllByRole('radio', { name: /^Attempt \d$/ });
+    expect(attemptButtons.map((button) => button.textContent)).toEqual([
+      'Attempt 1',
+      'Attempt 2',
+      'Attempt 3',
+    ]);
+  });
+});
+
+// Three attempts of one base iteration handed to the panel in descending order.
+// The panel's sort must reorder a copy for display without touching this array.
+function unsortedAttemptsNode(): RunDisplayNode {
+  return baseNode({
+    id: 'impl',
+    visibleExecutionInstanceId: 'attempt-3',
+    executionInstances: [
+      instance({ id: 'attempt-3', attempt: { kind: 'attempt', value: 3 }, status: 'completed' }),
+      instance({ id: 'attempt-2', attempt: { kind: 'attempt', value: 2 }, status: 'completed' }),
+      instance({ id: 'attempt-1', attempt: { kind: 'attempt', value: 1 }, status: 'completed' }),
+    ],
+  });
+}
+
 function instance(overrides: Partial<RunExecutionInstance> & { id: string }): RunExecutionInstance {
   return {
     semanticNodeId: 'node',

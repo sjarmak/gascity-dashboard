@@ -98,7 +98,8 @@ export interface RunDisplayNode {
   iterationSummary: RunIterationSummary;
   attemptSummary: RunAttemptSummary;
   visibleExecutionInstanceId: string;
-  executionInstances: RunExecutionInstance[];
+  /** Read-only at the contract boundary: consumers must sort/derive a copy, never mutate caller-owned run state. */
+  executionInstances: readonly RunExecutionInstance[];
   controlBadges: RunControlBadge[];
 }
 
